@@ -1,0 +1,99 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*.*.*'  # 当推送带有版本号的 tag（例如 v1.0.0）时触发工作流
+      - 'test*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { platform: "amd64", goos: "linux", file_ext: "tar.gz" }
+          - { platform: "arm64", goos: "linux", file_ext: "tar.gz" }
+          - { platform: "armv7l", goos: "linux", file_ext: "tar.gz" }
+          - { platform: "amd64", goos: "windows", file_ext: "zip" }
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go environment
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.23'  # 选择 Go 版本
+
+      - name: Set up npm
+        uses: actions/setup-node@v2
+        with:
+          node-version: '20'
+
+      - name: Build web frontend
+        working-directory: resources/web/js
+        run: |
+          npm install
+          npm run build
+
+      - name: tidy
+        run: go mod tidy
+
+      - name: Get tag version
+        run: |
+          TAG_VERSION="${GITHUB_REF##*/}"
+          VERSION="${TAG_VERSION#v}" 
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Write version to resources/version
+        run:  echo $VERSION > resources/version
+
+      - name: swag
+        run: |
+          go install github.com/swaggo/swag/cmd/swag@latest
+          swag init -g cmd/apimain.go --output docs/api --instanceName api --exclude http/controller/admin
+          swag init -g cmd/apimain.go --output docs/admin --instanceName admin --exclude http/controller/api
+
+      - name: Build for ${{ matrix.job.goos }}-${{ matrix.job.platform }}
+        run: |
+          mkdir release -p
+          cp -ar resources release/
+          cp -ar docs release/
+          cp -ar conf release/
+          mkdir -p release/data
+          mkdir -p release/runtime
+          if [ "${{ matrix.job.goos }}" = "windows" ]; then
+            sudo apt-get install gcc-mingw-w64-x86-64 zip -y
+            GOOS=${{ matrix.job.goos }} GOARCH=${{ matrix.job.platform }} CC=x86_64-w64-mingw32-gcc CGO_LDFLAGS="-static" CGO_ENABLED=1 go build -ldflags "-s -w" -o ./release/apimain.exe ./cmd/apimain.go
+            echo @echo off > release/start.bat
+            echo cmd /c \"%~dp0apimain.exe\" >> release/start.bat
+            zip -r ${{ matrix.job.goos}}-${{ matrix.job.platform }}.${{matrix.job.file_ext}} ./release
+          else
+            if [ "${{ matrix.job.platform }}" = "arm64" ]; then
+                wget https://musl.ljw.red/aarch64-linux-musl-cross.tgz
+                tar -xf aarch64-linux-musl-cross.tgz
+                export PATH=$PATH:$PWD/aarch64-linux-musl-cross/bin
+                GOOS=${{ matrix.job.goos }} GOARCH=${{ matrix.job.platform }} CC=aarch64-linux-musl-gcc CGO_LDFLAGS="-static" CGO_ENABLED=1 go build -ldflags "-s -w" -o ./release/apimain ./cmd/apimain.go
+            elif [ "${{ matrix.job.platform }}" = "armv7l" ]; then
+                wget https://musl.ljw.red/armv7l-linux-musleabihf-cross.tgz
+                tar -xf armv7l-linux-musleabihf-cross.tgz
+                export PATH=$PATH:$PWD/armv7l-linux-musleabihf-cross/bin
+                GOOS=${{ matrix.job.goos }} GOARCH=arm GOARM=7 CC=armv7l-linux-musleabihf-gcc CGO_LDFLAGS="-static" CGO_ENABLED=1 go build -ldflags "-s -w" -o ./release/apimain ./cmd/apimain.go
+            else
+              sudo apt-get install musl musl-dev musl-tools -y
+              GOOS=${{ matrix.job.goos }} GOARCH=${{ matrix.job.platform }} CC=musl-gcc CGO_LDFLAGS="-static" CGO_ENABLED=1 go build -ldflags "-s -w" -o ./release/apimain ./cmd/apimain.go
+            fi
+            tar -czf ${{ matrix.job.goos}}-${{ matrix.job.platform }}.${{matrix.job.file_ext}} ./release
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-api-${{ matrix.job.goos }}-${{ matrix.job.platform }}
+          path: |
+            ${{ matrix.job.goos}}-${{ matrix.job.platform }}.${{matrix.job.file_ext}}
